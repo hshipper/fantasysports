@@ -1,0 +1,285 @@
+---
+title: "Hold and Save Analysis"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+```{r include=FALSE}
+library(gridExtra)
+library(ggplot2)
+library(data.table)
+library(knitr)
+library(dplyr)
+```
+
+### What are we even doing here
+
+The purpose of this analysis is to research the impact of boosting save and hold
+point values for the league.  
+
+_Note: No hitters, perfect games, and pickoffs are being left out here_
+
+```{r include=FALSE}
+# generate pitching point value table:
+pt_vals <- c(3,-1,5,-3,5,-3,1,-1,-1,-1,3,3)
+names(pt_vals) <- c("IP", "ER", "W", "L", "SV", "BSv", "SO", "H", "BB", "HBP",
+                    "QS", "Hold")
+pt_edit <- c(3,-1,5,-3,7,-3,1,-1,-1,-1,3,5)
+names(pt_edit) <- names(pt_vals)
+```
+
+#### Current pitching point values
+
+```{r echo=FALSE,  results = 'asis'}
+kable(pt_vals)
+```
+
+#### Proposed values
+```{r echo = FALSE,  results = 'asis'}
+kable(pt_edit)
+```
+
+```{r include=FALSE}
+# tables acquired from bbref
+# export as csv -> copy/paste into sublime (text editor) and save to wd
+std_pitching <- fread("standard_pitching.csv")
+start_pitching <- fread("starting_pitching.csv")
+rel_pitching <- fread("relief_pitching.csv")
+```
+
+### Data
+Here's a quick look at each of the tables we're pulling in: standard pitching,
+relief pitching, and starting pitching.
+
+Standard pitching is our source of IP, W-L, SO, H, ER, SV, BB, K, and HBP.
+Unfortunately it's missing two stats that we have to get from the other tables, 
+respectively: Holds and QS.
+
+#### Standard pitching
+
+```{r echo=TRUE}
+#show sample data
+std_pitching[1:10,]
+```
+
+#### Relief pitching
+
+```{r}
+rel_pitching[1:10,]
+```
+
+#### Starting pitching
+
+One thing you'll notice in the starting pitching table is that there are three
+lines for Matt Andriese - he was traded midseason. The only row we care about is
+the total row, so we'll filter for those later.
+
+```{r}
+start_pitching[1:10,]
+```
+
+#### Cleaning the data and putting it all together
+
+As mentioned previously, we need to find all the players that have been traded 
+so that we don't end up with multiple records for the same player. The standard
+pitching table has everybody included in it. Conveniently, it also always lists 
+the "Total" row first, so we can use a trick to get just the first row for each
+name. We'll need to do this for all of our data tables.
+
+```{r}
+tot_all_pitchers <- std_pitching[, .SD[1], by = Name]
+tot_rel_pitchers <- rel_pitching[, .SD[1], by = Name]
+tot_start_pitchers <- start_pitching[, .SD[1], by = Name]
+```
+
+Next we'll need to filter our relief and starting pitcher tables down to just 
+the columns that we're intersted in, Holds and QS, respectively.
+
+```{r}
+hold_rel_pitchers <- tot_rel_pitchers[, .(Name, Hold, BSv)]
+qs_start_pitchers <- tot_start_pitchers[, .(Name, QS)]
+```
+
+Lastly we set keys for the data tables and join them all together:
+```{r}
+setkey(tot_all_pitchers, "Name")
+setkey(hold_rel_pitchers, "Name")
+setkey(qs_start_pitchers, "Name")
+
+full_pitchers <- hold_rel_pitchers[qs_start_pitchers[tot_all_pitchers]]
+```
+
+Here's what our new data table looks like:
+```{r}
+full_pitchers[1:10,]
+```
+
+Now we need to clean up the NA's, since that'll cause us problems when we try to
+generate point totals. We can infer that these should be 0's if they don't exist
+.
+
+```{r}
+# Thanks Matt Dowle
+# https://stackoverflow.com/questions/7235657/fastest-way-to-replace-nas-in-a-large-data-table
+# plaigarism is bad
+
+cleandt <- function(DT) {
+for (j in seq_len(ncol(DT)))
+  set(DT, which(is.na(DT[[j]])),j,0)
+}
+
+cleandt(full_pitchers)
+```
+
+The purpose of this is to compare how much better relievers get, so we need to 
+devise a way to make sure that we track what position a player falls into.
+
+```{r}
+# If a pitcher is not in starting pitcher table label as a reliever
+# If a pitcher is in starting pitching and in relieving, label as both
+# Otherwise label as starter
+full_pitchers[, pos:= ifelse(!Name %in% qs_start_pitchers$Name, "RP",
+                              ifelse(Name %in% hold_rel_pitchers$Name, "RP/SP",
+                                     "SP"))]
+full_pitchers
+```
+
+### Analysis
+
+Next up we need to generate point totals for both scoring systems. 
+
+We'll do this by taking the columns that line up with our scoring system, 
+turning our data table into a matrix, and then multiplying it by our score
+vector. It's a neat trick.
+
+```{r}
+
+# prepoints are scores prior to the scoring change
+full_pitchers[, prepoints := 
+                full_pitchers[, names(pt_vals), with = FALSE] %>%
+                as.matrix() %*% pt_vals]
+
+# postpoints are scores post scoring change
+full_pitchers[, postpoints := 
+                full_pitchers[, names(pt_vals), with = FALSE] %>%
+                as.matrix() %*% pt_edit]
+
+# point change is difference
+full_pitchers[, ptchange := postpoints - prepoints]
+```
+
+#### Comparing before and after
+
+With scores calculated, what's left is to assess how things changed.
+
+First we'll take a look at how the composition of the top pitchers ranked.
+
+For the purpose of tracking fringe pitchers, we'll look at the top 120 before
+and after (12 pitchers/team).
+
+```{r include=FALSE}
+full_pitchers[, prerank := frankv(full_pitchers[["prepoints"]], order = -1)]
+full_pitchers[, postrank := frankv(full_pitchers[["postpoints"]], order = -1)]
+full_pitchers[, rankchange := prerank - postrank]
+top_pre_pitchers <- full_pitchers[prerank <= 120]
+top_post_pitchers <- full_pitchers[postrank <= 120]
+```
+
+```{r echo=FALSE}
+top_pre_pitchers$pos %>% table() %>% kable(caption = "Pre-scoring change
+                                           breakdown by pitcher type")
+```
+
+
+```{r echo=FALSE}
+top_post_pitchers$pos %>% table() %>% kable(caption = "Post-scoring change
+                                           breakdown by pitcher type")
+```
+
+Here are the interesting findings: players that enter and leave the top 120.
+
+The relievers that enter the top 120:
+
+```{r echo=FALSE}
+top_post_pitchers[!Name %in% top_pre_pitchers$Name]
+```
+
+And the other pitchers that leave:
+```{r echo=FALSE}
+top_pre_pitchers[!Name %in% top_post_pitchers$Name]
+```
+
+Within the new top 120, it's also worth looking at where the pitchers are by
+percentile.
+
+#### Graph time
+
+```{r echo=FALSE}
+preg <-
+  top_pre_pitchers %>%
+    ggplot(aes(x = postpoints, color = pos)) +
+    geom_density() +
+    ggtitle("Point distribution before scoring change")
+
+postg <-
+  top_post_pitchers %>%
+    ggplot(aes(x = postpoints, color = pos)) +
+    geom_density() +
+    ggtitle("Point distribution after scoring change")
+
+preg
+postg
+```
+
+
+```{r echo=FALSE}
+top_pre_pitchers %>%
+  ggplot(aes(x = factor(pos), y=prepoints)) +
+  geom_boxplot() +
+  ggtitle("Point distribution within pitcher types pre-scoring change")
+
+top_post_pitchers %>%
+  ggplot(aes(x = factor(pos), y=postpoints)) +
+  geom_boxplot() +
+  ggtitle("Point distribution within pitcher types post-scoring change")
+```
+
+As shown in the plots above, relievers gain quite a bit in points here:
+Before the change, here's how the top relievers points broke down:
+```{r echo=FALSE}
+top_pre_pitchers[pos != "SP"]$prepoints %>% summary()
+```
+_This does include dual type pitchers, as they likely will have RP eligibility._
+_This causes some problems because Trevor Bauer is one of these._
+
+And here is the after:
+```{r echo=FALSE}
+top_post_pitchers[pos != "SP"]$postpoints %>% summary()
+```
+
+### Conclusion
+
+Adding points for holds and saves is probably a good idea. It should make
+relievers comparable with many of the streamers/fringe starters as well as move
+some of the elite relievers further up into the pitcher pool.
+
+Importantly, this shouldn't disturb the balance of pitcher/hitter value by much.
+
+Prior to any scoring change, and assuming the top 120 pitchers are rostered (and
+perfectly average, so yeah it's a lot of assumptions but come on what else can
+we do), each team nets roughly 213 points per week from pitching:
+```{r}
+#sum all points and divide by 25 weeks * 10 teams
+top_pre_pitchers$prepoints %>% sum() / (25*10)
+```
+With the change, teams would on average gain about 7 points per week:
+```{r}
+#do the same thing as before
+top_post_pitchers$postpoints %>% sum() / (25*10)
+```
+
+This seems like a pretty reasonable update to make. If you would like to look at
+the data yourself, I have the csv files used to generate this data. 
+
